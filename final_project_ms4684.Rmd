@@ -1,0 +1,1898 @@
+---
+title: "Racist Legacy of Redlining"
+author: "Maryam Khalid Shah"
+date: "12/4/2021"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# load libraries
+
+library(lubridate)
+library(sf)
+library(tmap)
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+library(obsval)
+
+# use the following code to install the obsval package 
+# devtools::install_github("chrismeserole/obsval")
+
+```
+
+## Data Acquisition
+
+Data on elementary public schools was obtained from the [Common Core of Data](https://nces.ed.gov/ccd/) using the [Elementary/Secondary Information System (ElSi)](https://nces.ed.gov/ccd/elsi/) web application. 
+
+Read in the data, clean column names, filter and remove irrelevant columns. Relevant columns include student race, the number of students receiving free and reduced lunch data, the school ID, school name and the state it is in. 
+
+```{r load public school data}
+
+nces <-
+  readxl::read_excel('data/raw/elsi_excel.xlsx') %>% 
+  set_names(
+    str_remove_all(
+      names(.),
+      '[^A-Za-z]|Latest available year|Public School')) %>% 
+  mutate(StateName = tolower(StateName)) %>% 
+  filter(StateAbbr %in% c('IL','CA','NY'),
+         SchoolLevelSYonward == 'Elementary') %>% 
+  select(-c(AgencyName,
+            SchoolType,
+            CharterSchool,
+            MagnetSchool,
+            SharedTimeSchool,
+            UrbancentricLocale,
+            FullTimeEquivalentFTETeachers,
+            FreeLunchEligible,
+            ReducedpriceLunchEligibleStudents))
+
+```
+
+School-by-school student expenditure data obtained from the [National Education Resource Database on Schools (NERD$)](https://edunomicslab.org/nerds/) hosted by the Edunomics Lab at Georgetown University.
+
+Read in the student expenditure data and select relevant columns (per pupil expenditure, school ID, and state).
+
+```{r load student expenditure data}
+
+nerds <- 
+  read_csv('data/raw/nerds.csv') %>% 
+  mutate(SchoolIDNCESAssigned = as.numeric(ncesid)) %>% 
+  select(SchoolIDNCESAssigned,
+         pp_total_raw,
+         state)
+
+# store expenditure data separately for each state
+
+nested_exp <- 
+  nerds %>%
+  filter(state %in% c('IL','CA','NY')) %>% 
+  group_by(state) %>% 
+  nest()
+
+```
+
+Load school attendance boundary shapefiles for the three cities: [Chicago](https://data.cityofchicago.org/), [Los Angeles](https://geohub.lacity.org) and [New York](https://data.cityofnewyork.us/). These are elementary school attendance boundaries.
+
+```{r load school attendance boundary shapefiles}
+
+# specify path
+
+read_dir <- 'data/raw/spatial/SABS'
+
+# read in shapefiles, set names, and assign to global environment
+
+list.files(
+  read_dir,
+  pattern = '.shp') %>% 
+  purrr::map(
+    ~ file.path(read_dir, .) %>% 
+      st_read() %>% 
+      st_make_valid()) %>% 
+  set_names(
+    'ny_sab',
+    'chicago_sab',
+    'la_sab') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+Read in shapefiles of the [Home Owners' Loan Corporation redlining maps](https://dsl.richmond.edu/panorama/redlining/#loc=5/39.1/-94.58&text=downloads) for the three cities. 
+
+```{r load HOLC redlining map shapefiles}
+
+# specify path 
+
+read_dir <- 'data/raw/spatial/HOLC'
+
+# read in shapefiles, set names, and assign to global environment
+
+list.files(
+  read_dir,
+  pattern = '.shp') %>% 
+  purrr::map(
+    ~ file.path(read_dir, .) %>% 
+      st_read() %>% 
+      st_make_valid()) %>% 
+  set_names(
+    'la_holc_shp',
+    'ch_holc_shp',
+    'ny_bronx_holc_shp',
+    'ny_brklyn_holc_shp',
+    'ny_mhtn_holc_shp',
+    'ny_queens_holc_shp',
+    'ny_stisl_holc_shp') %>% 
+  list2env(.GlobalEnv)
+
+# store NY shapefiles as tibbles
+
+list(ny_brklyn_holc_shp,
+     ny_bronx_holc_shp,
+     ny_mhtn_holc_shp,
+     ny_queens_holc_shp,
+     ny_stisl_holc_shp) %>% 
+  map(~as_tibble(.)) %>% 
+  set_names('ny_brklyn_holc_tibble',
+            'ny_bronx_holc_tibble',
+            'ny_mhtn_holc_tibble',
+            'ny_queens_holc_tibble',
+            'ny_stisl_holc_tibble') %>% 
+  list2env(.GlobalEnv)
+
+# combine New York shapefiles into one shapefile
+
+ny_holc_shp <- 
+  rbind(ny_brklyn_holc_tibble,
+        ny_bronx_holc_tibble,
+        ny_mhtn_holc_tibble,
+        ny_queens_holc_tibble,
+        ny_stisl_holc_tibble) %>% 
+  filter(holc_grade %in% c('A',
+                           'B',
+                           'C',
+                           'D')) %>% 
+  st_as_sf()
+
+```
+
+## Data Analysis
+
+Convert all shapefiles (redlining maps and school attendance boundaries) to a projected CRS. 
+
+```{r convert shapefiles to projected CRS}
+
+list(chicago_sab,
+     la_sab,
+     ny_sab %>% 
+       filter(!st_is_empty(.)),
+     ch_holc_shp,
+     la_holc_shp,
+     ny_holc_shp) %>% 
+  map(~st_transform(., crs = 5070)) %>% 
+  set_names('chicago_sab_prj',
+            'la_sab_prj',
+            'ny_sab_prj',
+            'ch_holc_shp_prj',
+            'la_holc_shp_prj',
+            'ny_holc_shp_prj') %>% 
+  list2env(.GlobalEnv)
+
+```
+Intersect the data, then transform back to the target CRS. Calculate the area percentage of each HOLC grade in each school attendance boundary (SAB), and create a new column to store the majority HOLC grade for each SAB.
+
+```{r find intersection of redlining maps and SABs}
+
+# Chicago
+
+ch_sab_holc <- 
+  st_intersection(
+    ch_holc_shp_prj,
+    chicago_sab_prj) %>% 
+  st_transform(
+        st_crs(ch_holc_shp))
+
+# LA 
+
+la_sab_holc <- 
+  st_intersection(
+    la_holc_shp_prj,
+    la_sab_prj) %>% 
+  rename(unit_id = OBJECTID) %>% 
+  st_transform(
+        st_crs(la_holc_shp))
+
+# NY 
+
+ny_sab_holc <- 
+  st_intersection(
+    ny_holc_shp_prj,
+    ny_sab_prj) %>% 
+  rename(unit_id = esid_no) %>% 
+  st_transform(
+        st_crs(ny_holc_shp))
+
+# add in areas 
+
+list(ch_sab_holc,
+     la_sab_holc,
+     ny_sab_holc) %>% 
+  map(~mutate(.,
+              area = st_area(.) %>%
+                as.numeric()) %>% 
+  
+  # add area percentage and create new column to store majority HOLC grade
+  
+  group_by(unit_id,
+           holc_grade) %>% 
+  summarize(
+    area = sum(area)) %>% 
+  mutate(
+    area_perc = area/sum(area),
+    maj_grade = ifelse(
+      area_perc > 0.5,
+      holc_grade,
+      NA),
+    holc_maj_grade = last(na.omit(maj_grade))) %>% 
+    mutate_at('unit_id',
+            as.numeric) %>% 
+  
+  # remove SABs without a redlining/HOLC majority grade (i.e. where holc_maj_grade is NA), and remove the majority HOLC grade column (maj_grade)
+  
+  drop_na(holc_maj_grade) %>% 
+  select(-maj_grade)) %>% 
+  
+  # set names and assign to global environment
+
+  set_names('att_area_ch_perc',
+            'att_area_la_perc',
+            'att_area_ny_perc') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+Convert public school data to spatial point files.
+
+```{r}
+
+# nest public school data 
+
+nested_publicsch <- 
+  nces %>% 
+  group_by(StateAbbr) %>% 
+  nest() 
+
+# convert to spatial points files
+
+list(nested_publicsch$data[[1]] %>% 
+       add_column(
+         StateAbbr = 'IL'),
+     nested_publicsch$data[[2]] %>% 
+       add_column(
+         StateAbbr = 'NY'),
+     nested_publicsch$data[[3]] %>% 
+       add_column(
+         StateAbbr = 'CA')) %>% 
+  map(~st_as_sf(.,
+                coords = c('Longitude',
+                           'Latitude'),
+                crs = 4269)) %>% 
+  set_names('il_schools_sf',
+            'ny_schools_sf',
+            'ca_schools_sf') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+
+Intersect these spatial point files with SABs to determine the schools in each SAB. Then intersect with redlining shapefiles to determine which former HOLC grade a school is located in.
+
+```{r spatial point files}
+
+# transform CRS of both spatial points files and shapefiles to planar (required by st_intersection)
+
+list(il_schools_sf,
+     ca_schools_sf,
+     ny_schools_sf,
+     chicago_sab,
+     la_sab,
+     ny_sab %>% 
+       filter(!st_is_empty(.))) %>% 
+  map(~st_transform(.,
+                    crs = 2163)) %>% 
+  set_names('il_schools_prj',
+            'ca_schools_prj',
+            'ny_schools_prj',
+            'chicago_sab_prj',
+            'la_sab_prj',
+            'ny_sab_prj') %>% 
+  list2env(.GlobalEnv)
+
+# nest SAB and redlining intersection data
+
+nested_sab_holc <-
+  rbind(
+    ch_sab_holc %>% 
+      select(unit_id) %>% 
+      add_column(city = 'Chicago'),
+    la_sab_holc %>%
+      select(unit_id) %>% 
+      add_column(city = 'Los Angeles'),
+    ny_sab_holc %>%
+      select(unit_id) %>% 
+      add_column(city = 'New York')) %>% 
+  group_by(city) %>% 
+  nest()
+
+# nest planar CRS spatial point files
+
+nested_schools_prj <-
+  rbind(
+    il_schools_prj,
+    ca_schools_prj,
+    ny_schools_prj) %>% 
+  group_by(StateAbbr) %>% 
+  nest()
+
+# intersect redlining shapefiles and points (schools)
+
+schools_sab_holc <-
+  map_dfr(
+    1:length(unique(nested_sab_holc$data)),
+    
+    function(i) {
+    
+    # Output per iteration:
+    
+    st_intersection(
+      st_transform(
+        nested_sab_holc$data[[i]],
+        crs = 2163),
+      nested_schools_prj$data[[i]]) %>% 
+      mutate_at('unit_id',
+                as.numeric)})
+
+# separate data for the three cities and store in global env
+
+list(
+  schools_sab_holc %>% 
+    filter(StateName == 'illinois'),
+  schools_sab_holc %>% 
+    filter(StateName == 'california'),
+  schools_sab_holc %>% 
+    filter(StateName == 'new york')) %>% 
+  set_names('el_ch_schools_sab_holc',
+            'el_la_schools_sab_holc',
+            'el_ny_schools_sab_holc') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+Store information on SABs, HOLC grades and elementary public schools in a combined dataframe, and create separate dataframes for each city as well. 
+
+```{r create dataframe of SABs, HOLC grades & Schools}
+
+# nest SAB, HOLC grade objects
+
+att_area_perc <- 
+  rbind(att_area_ch_perc %>% 
+          add_column(city = 'Chicago',
+                     state = 'illinois'),
+        att_area_la_perc %>% 
+          add_column(city = 'Los Angeles',
+                     state = 'california'),
+        att_area_ny_perc %>% 
+          add_column(city = 'New York',
+                     state = 'new york')) %>%
+  group_by(city) %>% 
+  nest()
+
+# nest SAB and school objects
+
+el_schools_sab_holc <- 
+  rbind(el_ch_schools_sab_holc,
+        el_la_schools_sab_holc,
+        el_ny_schools_sab_holc) %>% 
+  group_by(StateName) %>% 
+  nest()
+
+# store SAB, HOLC grade and school info in a dataframe
+
+combined_df <-
+  map_dfr(
+    1:length(unique(att_area_perc$data)),
+    
+    function(i) {
+      left_join(
+      att_area_perc$data[[i]],
+      el_schools_sab_holc$data[[i]],
+      by = "unit_id") %>%
+      as.data.frame()
+})
+
+# store dataframes for each city separately
+
+list(combined_df %>% 
+       filter(state == 'illinois'),
+     combined_df %>% 
+       filter(state == 'california'),
+     combined_df %>% 
+       filter(state == 'new york')) %>%
+  set_names('ch_df',
+            'la_df',
+            'ny_df') %>% 
+  list2env(.GlobalEnv)
+
+```
+Identify schools in school attendance boundaries by HOLC majority grades e.g. determine schools in school attendance boundaries with HOLC grade A majority area for each city.
+
+```{r filter dataframes by HOLC majority grades}
+
+# determine schools in school attendance boundaries with HOLC grade A majority area for each city
+
+list(ch_df,
+     la_df,
+     ny_df) %>% 
+  map(~filter(.,
+              holc_grade == 'A')) %>% 
+  set_names('ch_schools_a',
+            'la_schools_a',
+            'ny_schools_a') %>% 
+  list2env(.GlobalEnv)
+
+# determine schools in school attendance boundaries with HOLC grade D majority area for each city
+
+list(ch_df,
+     la_df,
+     ny_df) %>% 
+  map(~filter(.,
+              holc_grade == 'D')) %>% 
+  set_names('ch_schools_d',
+            'la_schools_d',
+            'ny_schools_d') %>% 
+  list2env(.GlobalEnv)
+
+# determine schools in school attendance boundaries with HOLC grade A or B majority areas
+
+list(ch_df,
+     la_df,
+     ny_df) %>% 
+  map(~filter(.,
+              holc_grade %in% c('A','B'))) %>% 
+  set_names('ch_schools_a_b',
+            'la_schools_a_b',
+            'ny_schools_a_b') %>% 
+  list2env(.GlobalEnv)
+
+# determine schools in school attendance boundaries with HOLC grade C or D majority areas
+
+list(ch_df,
+     la_df,
+     ny_df) %>% 
+  map(~filter(.,
+              holc_grade %in% c('C','D'))) %>% 
+  set_names('ch_schools_c_d',
+            'la_schools_c_d',
+            'ny_schools_c_d') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+Store average racial composition of schools' student populations for all school attendance boundaries, grouped by their majority HOLC grade.
+
+```{r store average race % of schools by HOLC grades}
+
+# store average race % of schools for HOLC majority A grade
+
+list(ch_schools_a,
+     la_schools_a,
+     ny_schools_a) %>% 
+  map(~select(.,
+              AmericanIndianAlaskaNativeStudents:TotalRaceEthnicity) %>% 
+        pivot_longer(
+          AmericanIndianAlaskaNativeStudents:TwoorMoreRacesStudents,
+          names_to = 'race_ethnicity') %>%
+        transmute(
+          race_ethnicity,
+          value = as.numeric(value)/as.numeric(TotalRaceEthnicity) * 100) %>%
+        group_by(race_ethnicity) %>%
+        summarize(value = mean(value, na.rm = TRUE)) %>%
+        add_column(holc_maj_grade = 'A') %>%
+        mutate(
+          race_ethnicity = str_replace_all(
+            race_ethnicity,
+            c('AmericanIndianAlaskaNativeStudents' = 'American Indian/Alaska Native',
+              'AsianorAsianPacificIslanderStudents' = 'Asian/Asian Pacific Islander',
+              'HispanicStudents' = 'Hispanic',
+              'BlackorAfricanAmericanStudents' = 'Black/African American',
+              'WhiteStudents' = 'White',
+              'NatHawaiianorOtherPacificIslStudents' = 'Native Hawaiian/Pacific Islander',
+              'TwoorMoreRacesStudents' = 'Two or more Races')))) %>% 
+  set_names('ch_schools_a_race',
+            'la_schools_a_race',
+            'ny_schools_a_race') %>% 
+  list2env(.GlobalEnv)
+
+# store average race % of schools for HOLC majority D grade
+
+list(ch_schools_d,
+     la_schools_d,
+     ny_schools_d) %>% 
+  map(~select(.,
+              AmericanIndianAlaskaNativeStudents:TotalRaceEthnicity) %>% 
+        pivot_longer(
+          AmericanIndianAlaskaNativeStudents:TwoorMoreRacesStudents,
+          names_to = 'race_ethnicity') %>%
+        transmute(
+          race_ethnicity,
+          value = as.numeric(value)/as.numeric(TotalRaceEthnicity) * 100) %>%
+        group_by(race_ethnicity) %>%
+        summarize(value = mean(value, na.rm = TRUE)) %>%
+        add_column(holc_maj_grade = 'D') %>%
+        mutate(
+          race_ethnicity = str_replace_all(
+            race_ethnicity,
+            c('AmericanIndianAlaskaNativeStudents' = 'American Indian/Alaska Native',
+              'AsianorAsianPacificIslanderStudents' = 'Asian/Asian Pacific Islander',
+              'HispanicStudents' = 'Hispanic',
+              'BlackorAfricanAmericanStudents' = 'Black/African American',
+              'WhiteStudents' = 'White',
+              'NatHawaiianorOtherPacificIslStudents' = 'Native Hawaiian/Pacific Islander',
+              'TwoorMoreRacesStudents' = 'Two or more Races')))) %>% 
+  set_names('ch_schools_d_race',
+            'la_schools_d_race',
+            'ny_schools_d_race') %>% 
+  list2env(.GlobalEnv)
+
+# store average race % of schools for HOLC majority A/B grade
+
+list(ch_schools_a_b,
+     la_schools_a_b,
+     ny_schools_a_b) %>% 
+  map(~select(.,
+              AmericanIndianAlaskaNativeStudents:TotalRaceEthnicity) %>% 
+        pivot_longer(
+          AmericanIndianAlaskaNativeStudents:TwoorMoreRacesStudents,
+          names_to = 'race_ethnicity') %>%
+        transmute(
+          race_ethnicity,
+          value = as.numeric(value)/as.numeric(TotalRaceEthnicity) * 100) %>%
+        group_by(race_ethnicity) %>%
+        summarize(value = mean(value, na.rm = TRUE)) %>%
+        add_column(holc_maj_grade = 'A/B') %>%
+        mutate(
+          race_ethnicity = str_replace_all(
+            race_ethnicity,
+            c('AmericanIndianAlaskaNativeStudents' = 'American Indian/Alaska Native',
+              'AsianorAsianPacificIslanderStudents' = 'Asian/Asian Pacific Islander',
+              'HispanicStudents' = 'Hispanic',
+              'BlackorAfricanAmericanStudents' = 'Black/African American',
+              'WhiteStudents' = 'White',
+              'NatHawaiianorOtherPacificIslStudents' = 'Native Hawaiian/Pacific Islander',
+              'TwoorMoreRacesStudents' = 'Two or more Races')))) %>% 
+  set_names('ch_schools_a_b_race',
+            'la_schools_a_b_race',
+            'ny_schools_a_b_race') %>% 
+  list2env(.GlobalEnv)
+
+# store average race % of schools for HOLC majority C/D grade
+
+list(ch_schools_c_d,
+     la_schools_c_d,
+     ny_schools_c_d) %>% 
+  map(~select(.,
+              AmericanIndianAlaskaNativeStudents:TotalRaceEthnicity) %>% 
+        pivot_longer(
+          AmericanIndianAlaskaNativeStudents:TwoorMoreRacesStudents,
+          names_to = 'race_ethnicity') %>%
+        transmute(
+          race_ethnicity,
+          value = as.numeric(value)/as.numeric(TotalRaceEthnicity) * 100) %>%
+        group_by(race_ethnicity) %>%
+        summarize(value = mean(value, na.rm = TRUE)) %>%
+        add_column(holc_maj_grade = 'C/D') %>%
+        mutate(
+          race_ethnicity = str_replace_all(
+            race_ethnicity,
+            c('AmericanIndianAlaskaNativeStudents' = 'American Indian/Alaska Native',
+              'AsianorAsianPacificIslanderStudents' = 'Asian/Asian Pacific Islander',
+              'HispanicStudents' = 'Hispanic',
+              'BlackorAfricanAmericanStudents' = 'Black/African American',
+              'WhiteStudents' = 'White',
+              'NatHawaiianorOtherPacificIslStudents' = 'Native Hawaiian/Pacific Islander',
+              'TwoorMoreRacesStudents' = 'Two or more Races')))) %>% 
+  set_names('ch_schools_c_d_race',
+            'la_schools_c_d_race',
+            'ny_schools_c_d_race') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+For all school attendance boundaries grouped by their majority HOLC grade, store the average percentage of students receiving free or reduced lunch in schools.
+
+```{r store average free and reduced lunch students % of schools by HOLC grades}
+
+# store average free and reduced lunch students % of schools in majority HOLC grade A SABs
+
+list(ch_schools_a,
+     la_schools_a,
+     ny_schools_a) %>% 
+  map(~transmute(.,
+                 free_lunch_avg = as.numeric(FreeandReducedLunchStudents)/as.numeric(TotalStudentsAllGradesExcludesAE) * 100) %>%
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'A')) %>%
+  set_names('ch_schools_a_lunch',
+            'la_schools_a_lunch',
+            'ny_schools_a_lunch') %>% 
+  list2env(.GlobalEnv)
+
+# store average free and reduced lunch students % of schools in majority HOLC grade D SABs
+
+list(ch_schools_d,
+     la_schools_d,
+     ny_schools_d) %>% 
+  map(~transmute(.,
+                 free_lunch_avg = as.numeric(FreeandReducedLunchStudents)/as.numeric(TotalStudentsAllGradesExcludesAE) * 100) %>%
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'D')) %>%
+  set_names('ch_schools_d_lunch',
+            'la_schools_d_lunch',
+            'ny_schools_d_lunch') %>% 
+  list2env(.GlobalEnv)
+
+# store average free and reduced lunch students % of schools in majority HOLC grade A/B SABs
+
+list(ch_schools_a_b,
+     la_schools_a_b,
+     ny_schools_a_b) %>% 
+  map(~transmute(.,
+                 free_lunch_avg = as.numeric(FreeandReducedLunchStudents)/as.numeric(TotalStudentsAllGradesExcludesAE) * 100) %>%
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'A/B')) %>%
+  set_names('ch_schools_a_b_lunch',
+            'la_schools_a_b_lunch',
+            'ny_schools_a_b_lunch') %>% 
+  list2env(.GlobalEnv)
+
+# store average free and reduced lunch students % of schools in majority HOLC grade C/D SABs
+
+list(ch_schools_c_d,
+     la_schools_c_d,
+     ny_schools_c_d) %>% 
+  map(~transmute(.,
+                 free_lunch_avg = as.numeric(FreeandReducedLunchStudents)/as.numeric(TotalStudentsAllGradesExcludesAE) * 100) %>%
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'C/D')) %>%
+  set_names('ch_schools_c_d_lunch',
+            'la_schools_c_d_lunch',
+            'ny_schools_c_d_lunch') %>% 
+  list2env(.GlobalEnv)
+
+```
+
+For all school attendance boundaries grouped by their majority HOLC grade, store the average student expenditure in schools.
+
+```{r store average student expenditure of schools by HOLC grades}
+
+# nest school data for majority A SABs
+
+nested_schools_a <-
+  rbind(la_schools_a,
+        ch_schools_a,
+        ny_schools_a) %>%
+  group_by(state) %>% 
+  nest()
+
+# store average student expenditure of schools for HOLC majority A grade
+
+combined_schools_a_exp <-
+  map_dfr(
+    1:length(unique(nested_schools_a$data)),
+    
+    function(i) {
+      left_join(
+        nested_schools_a$data[[i]] %>% 
+          mutate(SchoolIDNCESAssigned = as.numeric(SchoolIDNCESAssigned)),
+        nested_exp$data[[i]],
+        by = "SchoolIDNCESAssigned") %>%
+        select(pp_total_raw) %>% 
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'A')
+})
+
+# add state column
+
+combined_schools_a_exp$state <- c('CA', 'IL', 'NY')
+
+# nest school data for majority D SABs
+
+nested_schools_d <-
+  rbind(la_schools_d,
+        ch_schools_d,
+        ny_schools_d) %>%
+  group_by(state) %>% 
+  nest()
+
+# store average student expenditure of schools for HOLC majority D grade
+
+combined_schools_d_exp <-
+  map_dfr(
+    1:length(unique(nested_schools_d$data)),
+  
+    function(i) {
+      left_join(
+        nested_schools_d$data[[i]] %>% 
+          mutate(SchoolIDNCESAssigned = as.numeric(SchoolIDNCESAssigned)),
+        nested_exp$data[[i]],
+        by = "SchoolIDNCESAssigned") %>%
+        select(pp_total_raw) %>% 
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'D')
+})
+
+# add state column
+
+combined_schools_d_exp$state <- c('CA', 'IL', 'NY')
+
+# nest school data for majority A/B SABs
+
+nested_schools_a_b <-
+  rbind(la_schools_a_b,
+        ch_schools_a_b,
+        ny_schools_a_b) %>%
+  group_by(state) %>% 
+  nest()
+
+# store average student expenditure of schools for HOLC majority A/B grade
+
+combined_schools_a_b_exp <-
+  map_dfr(
+    1:length(unique(nested_schools_a_b$data)),
+  
+    function(i) {
+      left_join(
+        nested_schools_a_b$data[[i]] %>% 
+          mutate(SchoolIDNCESAssigned = as.numeric(SchoolIDNCESAssigned)),
+        nested_exp$data[[i]],
+        by = "SchoolIDNCESAssigned") %>%
+        select(pp_total_raw) %>% 
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'A/B')
+})
+
+# add state column
+
+combined_schools_a_b_exp$state <- c('CA', 'IL', 'NY')
+
+# nest school data for majority C/D SABs
+
+nested_schools_c_d <-
+  rbind(la_schools_c_d,
+        ch_schools_c_d,
+        ny_schools_c_d) %>%
+  group_by(state) %>% 
+  nest()
+
+# store average student expenditure of schools for HOLC majority A/B grade
+
+combined_schools_c_d_exp <-
+  map_dfr(
+    1:length(unique(nested_schools_c_d$data)),
+  
+    function(i) {
+      left_join(
+        nested_schools_c_d$data[[i]] %>% 
+          mutate(SchoolIDNCESAssigned = as.numeric(SchoolIDNCESAssigned)),
+        nested_exp$data[[i]],
+        by = "SchoolIDNCESAssigned") %>%
+        select(pp_total_raw) %>% 
+        summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+        add_column(holc_maj_grade = 'C/D')
+})
+
+# add state column
+
+combined_schools_c_d_exp$state <- c('CA', 'IL', 'NY')
+
+```
+
+## Statistical Test
+
+${MajGrade_i} = \beta_0 +  \beta_1{WhiteMaj}_i + \beta_2{BlackMaj}_i + \beta_3{LunchMaj}_i + \epsilon_i$
+
+Run an ordered logistic model with the variable storing the majority grade of school attendance boundaries (`MajGrade`) as the dependent variable. Binary independent variables are calculated below, including a variable indicating whether a school has a majority White student body (`WhiteMaj`), whether it has a majority Black student body (`BlackMaj`), and whether a majority of the students are receiving free and reduced lunch (`LunchMaj`). 
+
+```{r ordered logistic regression}
+
+# get dataset ready
+
+model_data <- 
+  combined_df %>% 
+  drop_na() %>% 
+  mutate(holc_maj_grade = factor(holc_maj_grade,
+                             levels = c('A','B','C','D')),
+         SchoolIDNCESAssigned = as.numeric(SchoolIDNCESAssigned),
+         WhiteStudents = as.numeric(WhiteStudents),
+         BlackorAfricanAmericanStudents = as.numeric(BlackorAfricanAmericanStudents),
+         white_perc =
+           (WhiteStudents/as.numeric(TotalRaceEthnicity))*100,
+         black_perc =
+           (BlackorAfricanAmericanStudents/as.numeric(TotalRaceEthnicity))*100,
+         lunch_perc = as.numeric(FreeandReducedLunchStudents)/as.numeric(TotalRaceEthnicity)*100,
+         white_maj = ifelse(
+           white_perc > 50, 1, 0),
+         black_maj = ifelse(
+           black_perc > 50, 1, 0),
+         lunch_maj = ifelse(
+           lunch_perc > 50, 1, 0))
+
+# run ordered logistic model
+
+model_mass <- 
+  MASS::polr(holc_maj_grade ~ 
+             white_maj + black_maj + lunch_maj,
+             data = model_data,
+             method = "logistic",
+             Hess = T)
+
+# view results
+
+summary(model_mass,
+        digits = 2)
+
+# store table
+
+ctable <- 
+  coef(summary(model_mass))
+
+# calculate and store p values
+
+p <- 
+  pnorm(abs(ctable[, "t value"]),
+        lower.tail = FALSE) * 2
+
+# combined table
+
+cbind(ctable,
+      "p value" = p)
+
+```
+
+The coefficients cannot be directly interpreted. However, their directionality and statistical significance can be assessed. We can see that the coefficient on the variable depicting whether a school has a majority White student body is negative and statistically significant at the 95% confidence level, while the variable depicting whether a school has a majority African American student body is positive and statistically significant at the 95% confidence level owing to the high t-value and low p-value. The coefficient on the variable representing whether the majority of a school's student body is receiving free or reduced lunch however is not significant at the 95% confidence level. 
+
+Calculate the predicted probabilities of a school having/not having a majority White student body on the probability of being in a majority D grade school attendance boundary. 
+
+```{r predicted probabilities}
+
+# gather coefficients 
+
+B = model_mass$coefficients
+
+# gather cut points
+
+cuts = model_mass$zeta
+
+# extract the data matrix used to estimate the model 
+
+X = model.matrix(model_mass)[,-1] # drop the intercept
+
+# Calculate and view probabilities - Not White majority
+
+X[,1] = 0  
+
+pr_d_notwhite <- 
+  mean(
+    1 - plogis(cuts[3] - X%*%B))
+
+pr_d_notwhite
+
+# Calculate and view probabilities - White majority
+
+X[,1] = 1
+
+pr_d_white <- 
+  mean(
+    1 - plogis(cuts[3] - X%*%B))
+
+pr_d_white
+
+```
+
+The predicted probability of being in a (former) HOLC majority D grade school attendance boundary given that a school has a majority White student body is approximately 26%, whereas the predicted probability of being in a majority D grade school attendance boundary given that the school does not have a majority White student body is approximately 40%. Calculating the discrete difference shows that a school is approximately 14% less likely to be in a majority D grade school attendance boundary if it has a majority White student population.
+
+In order to assess whether this discrete difference is statistically significant, calculate confidence intervals around the discrete difference in the predicted probability of being in a majority D grade SAB (using the `obsval` package).
+
+```{r re-estimate model, echo=FALSE}
+
+# Re-estimate the model using obsval (the obsval package requires re-estimation of the model)
+
+model_mass_2 <- 
+  obsval(
+    holc_maj_grade ~ 
+    white_maj + black_maj + lunch_maj,
+    data = model_data,
+    ci = .95,
+    n.draws = 1000,
+    reg.model = "ologit",
+    effect.var = "white_maj",
+    effect.vals = c(0,1))
+
+```
+
+Extract the simulated predicted values around the 'D grade' outcome.
+
+```{r statistical significance}
+
+# not maj white, D grade
+
+not_maj_white <-
+  model_mass_2$preds[,4,1] 
+
+# maj white, D grade
+
+maj_white <-
+  model_mass_2$preds[,4,2] 
+
+# bounds - white
+
+bounds_white <- 
+  round(
+    quantile(maj_white,
+             probs=c(.025,.975)),3)
+
+# bounds - not white
+
+bounds_not_white <- 
+  round(
+    quantile(not_maj_white,
+             probs=c(.025,.975)),3)
+
+# store average effects
+
+ave_effect_white <- 
+  round(mean(maj_white),3)
+
+ave_effect_not_white <- 
+  round(mean(not_maj_white),3)
+
+# Organize as data frame - white
+
+tibble(lower = bounds_white[1],
+       ave_effect_white,
+       upper = bounds_white[2])
+
+# Organize as data frame - not white
+
+tibble(lower = bounds_not_white[1],
+       ave_effect_not_white,
+       upper = bounds_not_white[2])
+
+```
+
+The confidence intervals for `maj_white` = 1 and `maj_white` = 0 do not overlap, which indicates that the predicted probabilities are statistically significant. 
+
+```{r plot confidence intervals}
+
+# bind dataframes
+
+error_df <- 
+  rbind(tibble(lower = bounds_white[1],
+               ave_effect_white,
+               upper = bounds_white[2]) %>%
+          add_column(race = 'Majority White') %>%
+          rename(ave_effect = ave_effect_white),
+        tibble(lower = bounds_not_white[1],
+               ave_effect_not_white,
+               upper = bounds_not_white[2]) %>%
+          add_column(race = 'Not Majority White') %>%
+          rename(ave_effect = ave_effect_not_white))
+
+# plot
+
+ggplot(error_df, aes(x = race,
+                     y = upper,
+                     color = race)) + 
+  geom_point(aes(x = race,
+                 y = ave_effect)) +
+  geom_errorbar(aes(ymin = lower,
+                    ymax = upper),
+                width=.02,
+                position = position_dodge(0.05)) +
+  scale_color_manual(values = c('#01E0A3',
+                               '#D55E00')) +
+  labs(x = '',
+       y = 'Predicted Probability\n',
+       title = 'What is the likelihood of a school being in a\nmajority D grade School Attendance Boundary?',
+       subtitle = "Majority defined as greater than 50% of a school's student population") +
+  theme_classic() +
+  theme(plot.title = element_text(size=12,
+                              face = "bold",
+                              hjust = 0.5),
+        legend.position = "none",
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 11))
+
+```
+
+
+## Data Visualizations
+
+### Maps
+
+For each city, generate a static map displaying school attendance boundaries colored by their majority HOLC grade.
+
+For all maps and plots, a color-blind friendly palette by [Bang Wong](https://www.nature.com/articles/nmeth.1618) was used.
+
+```{r static tmap Chicago}
+
+# define palette
+
+holc_palette <- 
+  c('#01E0A3',
+    '#AFAFFF',
+    '#F0E442',
+    '#D55E00')
+
+# create basemap
+
+basemap <-
+  st_bbox(chicago_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot static
+
+tmap_mode('plot')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_ch_perc %>%
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+  
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+```{r static tmap LA}
+
+# create basemap
+
+basemap <-
+  st_bbox(la_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot static
+
+tmap_mode('plot')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_la_perc %>%
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+  
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+```{r static tmap NY}
+
+# create basemap
+
+basemap <-
+  st_bbox(ny_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot static
+
+tmap_mode('plot')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_ny_perc %>% 
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+For each city, generate an interactive map displaying school attendance boundaries colored by their majority HOLC grade.
+
+```{r interactive map Chicago with schools}
+
+# create basemap
+
+basemap <-
+  st_bbox(chicago_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot interactive
+
+tmap_mode('view')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_ch_perc %>%
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+  
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # add schools
+  
+  tm_shape(el_ch_schools_sab_holc %>% 
+             filter(unit_id %in% att_area_ch_perc$unit_id)) +
+  tm_dots(size = 0.005,
+          id = "SchoolIDNCESAssigned",
+          col = "black",
+          alpha = 0.7) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+```{r interactive map LA with schools}
+
+# create basemap
+
+basemap <-
+  st_bbox(la_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot interactive
+
+tmap_mode('view')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_la_perc %>%
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+  
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # add schools
+  
+  tm_shape(el_la_schools_sab_holc %>% 
+             filter(unit_id %in% att_area_la_perc$unit_id)) +
+  tm_dots(size = 0.005,
+          id = "SchoolIDNCESAssigned",
+          col = "black",
+          alpha = 0.7) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+```{r interactive map NY with schools}
+
+# create basemap
+
+basemap <-
+  st_bbox(ny_sab_prj) %>% 
+  tmaptools::read_osm() 
+
+# make plot interactive
+
+tmap_mode('view')
+
+# call basemap
+
+tm_shape(basemap) +
+  tm_rgb() +
+  
+  # add SABs
+  
+  tm_shape(att_area_ny_perc %>%
+             mutate(
+               holc_maj_grade = factor(
+                 holc_maj_grade,
+                 levels = c('A',
+                            'B',
+                            'C',
+                            'D'))) %>% 
+             rename('Majority Grade' = holc_maj_grade) %>% 
+             st_as_sf()) +
+  
+  tm_polygons(alpha = 0.6,
+              id = "unit_id",
+              col = 'Majority Grade',
+              palette = holc_palette) +
+  
+  # add schools
+  
+  tm_shape(el_ny_schools_sab_holc %>% 
+             filter(unit_id %in% att_area_ny_perc$unit_id)) +
+  tm_dots(size = 0.005,
+          id = "SchoolIDNCESAssigned",
+          col = "black",
+          alpha = 0.7) +
+  
+  # specify legend position
+  
+  tm_layout(legend.outside = TRUE)
+
+```
+
+Generate a static redlining map for each city. 
+
+```{r static redlining maps Chicago}
+
+ch_holc_shp %>% 
+  ggplot(aes(fill = holc_grade)) +
+  geom_sf() +
+  labs(fill = 'HOLC Grade') +
+  scale_fill_manual(values = c("#01E0A3",
+                               "#AFAFFF",
+                               "#F0E442",
+                               "#D55E00")) + 
+  theme_void()
+
+```
+
+```{r static redlining maps LA}
+
+la_holc_shp %>% 
+  ggplot(aes(fill = holc_grade)) +
+  geom_sf() +
+  labs(fill = 'HOLC Grade') +
+  scale_fill_manual(values = c("#01E0A3",
+                               "#AFAFFF",
+                               "#F0E442",
+                               "#D55E00")) +
+  theme_void()
+
+```
+
+```{r static redlining maps NY}
+
+ny_holc_shp %>% 
+  ggplot(aes(fill = holc_grade)) +
+  geom_sf() +
+  labs(fill = 'HOLC Grade') +
+  scale_fill_manual(values = c("#01E0A3",
+                               "#AFAFFF",
+                               "#F0E442",
+                               "#D55E00")) +
+  theme_void()
+
+```
+
+
+### Plots
+
+Plot school attendance boundaries by their majority HOLC grade for each city.
+
+```{r SABs by HOLC majority grade Chicago}
+
+# plot % of SABs by HOLC majority grade
+
+# specify data
+
+ggplot(ch_df) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_grade,
+               fill = as.factor(holc_grade),
+               y = (..count..)/sum(..count..)*100),
+           alpha = 0.7) + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'School Attendance Boundaries by Majority HOLC grade - Chicago',
+       subtitle = 'Majority is defined as an HOLC graded neighborhood having an area\nof more than 50% within a school attendance boundary\n',
+       x = '\nMajority Grade',
+       y = 'Percentage (%)\n') +
+  
+  # specify colors
+  
+  scale_fill_manual(values = 
+                      c("#01E0A3",
+                        "#AFAFFF",
+                        "#F0E442",
+                        "#D55E00")) +
+  
+  # modify legend
+  
+  theme(legend.position = 'None') +
+  
+  # modify axes limits 
+  
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 60))
+
+```
+
+```{r SABs by HOLC majority grade LA}
+
+# plot % of SABs by HOLC majority grade
+
+# specify data
+
+ggplot(la_df) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_grade,
+               fill = as.factor(holc_grade),
+               y = (..count..)/sum(..count..)*100),
+           alpha = 0.7) + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'School Attendance Boundaries by Majority HOLC grade - LA',
+       subtitle = 'Majority is defined as an HOLC graded neighborhood having an area\nof more than 50% within a school attendance boundary\n',
+       x = '\nHOLC Majority Grade',
+       y = 'Percentage (%)\n') +
+  
+  # specify colors
+  
+  scale_fill_manual(values = 
+                      c("#01E0A3",
+                        "#AFAFFF",
+                        "#F0E442",
+                        "#D55E00")) +
+  
+  # modify legend
+  
+  theme(legend.position = 'None') +
+  
+  # modify axes limits 
+  
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 50))
+
+```
+
+```{r SABs by HOLC majority grade NY}
+
+# plot % of SABs by HOLC majority grade
+
+# specify data
+
+ggplot(ny_df %>% 
+         filter(holc_grade %in% c('A','B','C','D'))) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_grade,
+               fill = as.factor(holc_grade),
+               y = (..count..)/sum(..count..)*100),
+           alpha = 0.7) + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'School Attendance Boundaries by Majority HOLC grade - NY',
+       subtitle = 'Majority is defined as an HOLC graded neighborhood having an area\nof more than 50% within a school attendance boundary\n',
+       x = '\nHOLC Majority Grade',
+       y = 'Percentage (%)\n') +
+  
+  # specify colors
+  
+  scale_fill_manual(values = 
+                      c("#01E0A3",
+                        "#AFAFFF",
+                        "#F0E442",
+                        "#D55E00")) +
+  
+  # modify legend
+  
+  theme(legend.position = 'None') +
+  
+  # modify axes limits 
+  
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 50))
+
+```
+
+Overall in all three cities, most school attendance boundaries have a C majority, followed by D and B. There are just a few majority A school attendance boundaries.
+
+For each city, plot the average racial composition of schools in majority A vs D school attendance boundaries.
+
+```{r race plot Chicago}
+
+# define data
+
+rbind(ch_schools_a_race,
+      ch_schools_d_race) %>% 
+  rename('Majority Grade' = holc_maj_grade) %>% 
+  mutate(paired = rep(1:7,2)) %>% 
+  
+  # plot
+  
+  ggplot(aes(x = value,
+             y = reorder(
+               race_ethnicity,
+               value))) +
+  geom_line(aes(group = paired),
+            color = 'slategray') +
+  geom_point(aes(color = `Majority Grade`),
+             size = 3,
+             alpha = 0.6) +
+  
+  # set title
+  
+  labs(title = 'Average Racial Composition in Schools - Chicago',
+       subtitle = 'Schools in School Attendance Boundaries of\n Majority A and D HOLC grades\n',
+       y = '\nRace/Ethnicity',
+       x = 'Percentage (%)\n') +
+  
+  # styling
+  
+  scale_color_manual(values = c("#01E0A3",
+                                "#D55E00")) +
+  scale_y_discrete(limits = c('White',
+                              'Native Hawaiian/Pacific Islander',
+                              'Two or more Races',
+                              'Hispanic',
+                              'Black/African American',
+                              'Asian/Asian Pacific Islander',
+                              'American Indian/Alaska Native')) + 
+  theme_classic() 
+  
+```
+
+```{r race plot LA}
+
+# define data
+
+rbind(la_schools_a_race,
+      la_schools_d_race) %>% 
+  rename('Majority Grade' = holc_maj_grade) %>% 
+  mutate(paired = rep(1:7,2)) %>% 
+  
+  # plot
+  
+  ggplot(aes(x = value,
+             y = reorder(
+               race_ethnicity,
+               value))) +
+  geom_line(aes(group = paired),
+            color = 'slategray') +
+  geom_point(aes(color = `Majority Grade`),
+             size = 3,
+             alpha = 0.6) +
+  
+  # set title
+  
+  labs(title = 'Average Racial Composition in Schools - Los Angeles',
+       subtitle = 'Schools in School Attendance Boundaries of\n Majority A and D HOLC grades\n',
+       y = '\nRace/Ethnicity',
+       x = 'Percentage (%)\n') +
+  
+  # styling
+  
+  scale_color_manual(values = c("#01E0A3",
+                                "#D55E00")) +
+    scale_y_discrete(limits = c('White',
+                              'Native Hawaiian/Pacific Islander',
+                              'Two or more Races',
+                              'Hispanic',
+                              'Black/African American',
+                              'Asian/Asian Pacific Islander',
+                              'American Indian/Alaska Native')) +
+  theme_classic() 
+
+```
+
+```{r race plot NY}
+
+# define data
+
+rbind(ny_schools_a_race,
+      ny_schools_d_race) %>% 
+  rename('Majority Grade' = holc_maj_grade) %>% 
+  mutate(paired = rep(1:7,2)) %>% 
+  
+  # plot
+  
+  ggplot(aes(x = value,
+             y = reorder(
+               race_ethnicity,
+               value))) +
+  geom_line(aes(group = paired),
+            color = 'slategray') +
+  geom_point(aes(color = `Majority Grade`),
+             size = 3,
+             alpha = 0.6) +
+  
+  # set title
+  
+  labs(title = 'Average Racial Composition in Schools - New York',
+       subtitle = 'Schools in School Attendance Boundaries of\n Majority A and D HOLC grades\n',
+       y = '\nRace/Ethnicity',
+       x = 'Percentage (%)\n') +
+  
+  # styling
+  
+  scale_color_manual(values = c("#01E0A3",
+                                "#D55E00")) +
+    scale_y_discrete(limits = c('White',
+                              'Native Hawaiian/Pacific Islander',
+                              'Two or more Races',
+                              'Hispanic',
+                              'Black/African American',
+                              'Asian/Asian Pacific Islander',
+                              'American Indian/Alaska Native')) +
+  theme_classic() 
+
+```
+
+For each city, plot the average percentage of students receiving free or reduced price lunch in schools in majority A vs D, and majority A/B vs C/D school attendance boundaries.
+
+```{r free and reduced price lunch plot Chicago}
+
+# specify data
+
+ggplot(
+  rbind(ch_schools_a_lunch,
+        ch_schools_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - Chicago',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade',
+       y = 'Students (%)\n') 
+
+# specify data
+
+ggplot(
+  rbind(ch_schools_a_b_lunch,
+        ch_schools_c_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - Chicago',
+       subtitle = 'Schools in School Attendance Boundaries of majority A or B HOLC \ngrades vs majority C or D HOLC grades\n',
+       x = '\nHOLC Grade\n',
+       y = '\nStudents (%)\n') 
+
+```
+
+```{r free and reduced price lunch plot LA}
+
+# specify data
+
+ggplot(
+  rbind(la_schools_a_lunch,
+        la_schools_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - Los Angeles',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade',
+       y = 'Students (%)\n') 
+
+# specify data
+
+ggplot(
+  rbind(la_schools_a_b_lunch,
+        la_schools_c_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - Los Angeles',
+       subtitle = 'Schools in School Attendance Boundaries of majority A or B HOLC \ngrades vs majority C or D HOLC grades\n',
+       x = '\nHOLC Grade\n',
+       y = '\nStudents (%)\n') 
+
+```
+
+```{r free and reduced price lunch plot NY}
+
+# specify data
+
+ggplot(
+  rbind(ny_schools_a_lunch,
+        ny_schools_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - New York',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade',
+       y = 'Students (%)\n') 
+
+# specify data
+
+ggplot(
+  rbind(ny_schools_a_b_lunch,
+        ny_schools_c_d_lunch)) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = free_lunch_avg),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Free and Reduced Lunch Students in Schools - New York',
+       subtitle = 'Schools in School Attendance Boundaries of majority A or B HOLC \ngrades vs majority C or D HOLC grades\n',
+       x = '\nHOLC Grade\n',
+       y = '\nStudents (%)\n') 
+
+```
+
+For each city, plot the average per pupil expenditure of schools in majority A vs D school attendance boundaries
+
+```{r student expenditure plot Chicago}
+
+# specify data
+
+ggplot(
+  rbind(combined_schools_a_exp,
+        combined_schools_d_exp) %>%
+    filter(state == 'IL')) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = pp_total_raw),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Per Pupil Expenditure in Schools - Chicago',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade',
+       y = 'Per-Pupil Expenditure ($)\n') +
+  scale_y_continuous(labels = scales::comma)
+
+```
+
+```{r student expenditure plot LA}
+
+# specify data
+
+ggplot(
+  rbind(combined_schools_a_exp,
+        combined_schools_d_exp) %>%
+    filter(state == 'CA')) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = pp_total_raw),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Per Pupil Expenditure in Schools - Los Angeles',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade',
+       y = 'Per-Pupil Expenditure ($)\n') +
+  scale_y_continuous(labels = scales::comma)
+
+```
+
+```{r student expenditure plot NY}
+
+# specify data
+
+ggplot(
+  rbind(combined_schools_a_exp,
+        combined_schools_d_exp) %>%
+    filter(state == 'NY')) +
+  
+  # specify plot type
+  
+  geom_bar(aes(x = holc_maj_grade,
+               y = pp_total_raw),
+           fill = "royalblue",
+           alpha = 0.7,
+           position = 'dodge',
+           stat = 'identity') + 
+  
+  # specify theme
+  
+  theme_bw() +
+  
+  # specify titles 
+  
+  labs(title = 'Average Per Pupil Expenditure in Schools - New York',
+       subtitle = 'Schools in School Attendance Boundaries of Majority A and D HOLC grades\n',
+       x = '\nHOLC Grade\n',
+       y = '\nPer-Pupil Expenditure ($)\n') +
+  scale_y_continuous(labels = scales::comma)
+
+```
+
